@@ -1,0 +1,607 @@
+#!/usr/bin/env perl
+# Copyright 2017 Frank Breedijk, Alex Smirnoff, Glenn ten Cate, Artien Bel, Theodoor Scholte
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ------------------------------------------------------------------------------
+# This script will call Zate Berg's Nessis-IVIL-Wrapper (see
+# https://github.com/Zate/Nessus-IVIL-Wrapper ) to connect to a Nessus instance,
+# initiate a scan, save the results as an IVIL file and import it
+# ------------------------------------------------------------------------------
+
+use strict;
+use warnings;
+use SeccubusV2;
+use Seccubus::IVIL;
+
+use Getopt::Long;
+use Carp;
+
+use JSON;
+use Data::Dumper;
+use LWP::UserAgent;
+
+my (
+    $user,
+    $password,
+    $password2,
+    @export,
+    $download,
+    $server,
+    $policy,
+    $port,
+    $hosts_file,
+    $workspace,
+    $scan,
+    $nodelete,
+    $help,
+    $verbose,
+    $quiet,
+    $sleep,
+    $cmd,
+    $sslcheck,
+    $token,
+    $r,
+    $retries,
+);
+
+
+# Default values for command line values
+$help = 0;
+$quiet = 0;
+$sleep = 10;
+$verbose = 0;
+$sslcheck=2;
+$retries = 3;
+
+GetOptions(
+    'user|u=s'          => \$user,
+    'password|p=s'      => \$password,
+    'pw=s'              => \$password2,
+    'server|s=s'        => \$server,
+    'policy|pol=s'      => \$policy,
+    'port=s'            => \$port,
+    'hosts|h=s'         => \$hosts_file,
+    'workspace|ws=s'    => \$workspace,
+    'export=s'          => \@export,
+    'scan|sc=s'         => \$scan,
+    'sleep=s'           => \$sleep,
+    'nodelete'          => \$nodelete,
+    'sslcheck!'         => \$sslcheck,
+    'retries'           => \$retries,
+    'verbose|v+'        => \$verbose,
+    'quiet|q!'          => \$quiet,
+    'help'              => \$help,
+);
+
+my @formats = qw(nessus html pdf);
+if ( @export ) {
+    @formats = ();
+    foreach my $format ( @export ) {
+        if ( $format =~ /^(nessus|html|pdf|csv|db)$/ ) {
+            unshift @formats, $format;
+        } else {
+            print "Ignoring invalid export format $format\n" unless $quiet;
+        }
+    }
+}
+my $nessus_format_found=0;
+foreach my $format ( @formats ) {
+    if ( $format eq "nessus") {
+        $nessus_format_found = 1;
+        last;
+    }
+}
+unless ( $nessus_format_found ) {
+    print STDERR "You need to at least export the scan in nessus format";
+    help();
+}
+
+
+
+
+help() if $help;
+$verbose = 0 if $quiet;
+
+$port = 8834 unless $port;               # Default port is 8834
+$password = $password2 unless $password; # Equalize the use of --pw
+
+my $checkssl = 1;
+if ( $sslcheck == 1 ) {
+    $checkssl = 1;
+} elsif ( $sslcheck == 0 ) {
+    $checkssl = 0;
+} elsif ( $port == 443 ) {
+    $checkssl = 1;
+} elsif ( $port == 8834 ) {
+    $checkssl = 0;
+}
+
+my $config = get_config();
+
+if ( ! $hosts_file ) {
+    print "You must specify a valid hosts spec";
+    help();
+} elsif ( ! $user ) {
+    print "You must specify a user";
+    help();
+} elsif ( ! $password ) {
+    print "You must specify a password";
+    help();
+} elsif ( ! $server ) {
+    print "You must specify a nessus server";
+    help();
+} elsif ( ! $policy ) {
+    print "You must specify a policy";
+    help();
+} elsif ( ! $workspace ) {
+    print "You must specify a workspace name";
+    help();
+} elsif ( ! $scan ){
+    print "You must specify a scan name";
+    help();
+};
+
+my $timestamp = make_timestamp();
+print "Timestamp = $timestamp\n" if $verbose > 1;
+my $tempscan = "seccubus.$workspace.$scan";
+my $tempfile = "/tmp/$tempscan.$$";
+my $nivil = "$config->{paths}->{scanners}\/Nessus\/nivil.rb";
+my $nessus2ivil = "perl -I$config->{paths}->{modules} $config->{paths}->{bindir}\/nessus2ivil";
+my $load_ivil = "perl -I$config->{paths}->{modules} $config->{paths}->{bindir}\/load_ivil";
+my $attach_file = "perl -I$config->{paths}->{modules} $config->{paths}->{bindir}\/attach_file";
+
+my $json;
+login();
+
+$json = rest_get("/editor/policy/templates",undef,\$r);
+die "Cannot get policy list" if ($r->code() != 200);
+
+my $tuuid;
+my $pid = -1;
+
+for my $pol (@{$json->{templates}} ) {
+    if ($pol->{name} eq $policy) {
+        $tuuid = $pol->{uuid};
+        last;
+    }
+}
+
+if (!$tuuid) {
+    for my $pol (@{$json->{templates}} ) {
+        if ($pol->{name} eq 'basic') {
+            $tuuid = $pol->{uuid};
+            last;
+        }
+    }
+
+    $json = rest_get("/policies",undef,\$r);
+    die "Cannot get policy list" if ($r->code() != 200);
+
+    foreach my $pol (@{$json->{policies}} ) {
+        if ($pol->{name} eq $policy) {
+            $tuuid = $pol->{template_uuid} if $pol->{template_uuid};
+            $pid = $pol->{id};
+            last;
+        }
+    }
+}
+
+if (!$tuuid && !$pid) {
+    die "Policy $policy not found";
+} else {
+    print "Found policy $policy as template $tuuid policy $pid\n" if $verbose;
+}
+
+my $scandata = {
+    'uuid'          => $tuuid,
+    'settings'      => {
+        'name'          => $tempscan,
+        'description'   => 'Seccubus automated scan',
+        'launch'        => 'ON_DEMAND',
+    }
+};
+
+if ( $pid != -1 ) {
+    $scandata->{settings}->{policy_id} = $pid;
+}
+
+if ( -e $hosts_file ) {         # Assume its a host spect rather then a
+                                # hosts file if there is no file
+    open(my $FILE,"<",$hosts_file) or die "Cannot read hosts file";
+    local $/;
+    $scandata->{settings}{text_targets} = <$FILE>;
+    close($FILE);
+} else {
+    $scandata->{settings}{text_targets} = $hosts_file;
+}
+
+print "Imported scan targets: $scandata->{settings}{text_targets} \n" if $verbose;
+
+$json = rest_get('/scans',undef,\$r);
+my $sid;
+foreach my $scan ( @{$json->{scans}} ) {
+    if ( $scan->{name} eq $tempscan ) {
+        $sid = $scan->{id};
+        last;
+    }
+}
+if ( $sid ) {
+    print "Previous scan found, updating\n" if $verbose;
+    $json = rest_put("/scans/$sid",encode_json($scandata),\$r);
+    die "Cannot update scan" if ($r->code() != 200);
+
+    print "Updated scan $sid\n" if $verbose;
+} else {
+    print "Scan doesn't exist yet, creating\n" if $verbose;
+    $json = rest_post("/scans",encode_json($scandata),\$r);
+    die "Cannot update scan" if ($r->code() != 200);
+
+    $sid = $json->{scan}{id};
+    print "Created scan $sid\n" if $verbose;
+
+}
+
+$json = rest_post("/scans/$sid/launch",{},\$r);
+die "Cannot launch scan" if ($r->code() != 200);
+
+my $launched = $json->{scan_uuid};
+print "Launched scan $launched\n" if $verbose;
+
+$json = rest_get("/scans/$sid", {}, \$r);
+die "Cannot get scan history" if ($r->code() != 200);
+my $hid;
+
+for my $history (@{$json->{history}} ) {
+    if ($history->{uuid} eq $launched) {
+        $hid = $history->{history_id};
+    }
+}
+
+if ($hid) {
+    print "Found history id $hid for scan $launched\n" if $verbose;
+} else {
+    die "Cannot find history id for scan $launched";
+}
+
+do {
+    sleep(5);
+    $json = rest_get("/scans/$sid", { 'history_id' => $hid }, \$r);
+
+    if ($r->code() eq 200) {
+        my $vulncount = @{$json->{vulnerabilities}};
+        print "Scan status: $json->{info}->{status}. $vulncount findings on $json->{info}->{hostcount} host(s).\n" if $verbose;
+    } else {
+        die "Scan status request returned " . $r->code();
+    }
+} until ($json->{info}->{status} eq "completed" || $json->{info}->{status} eq "canceled" || $json->{info}->{status} eq "aborted" );
+
+foreach my $format ( @formats ) {
+    print "Exporting report in $format format\n" unless $quiet;
+
+    my $exportdata = {
+        'format'    => $format,
+        'chapters'  => "vuln_hosts_summary;vuln_by_host;compliance_exec;remediations;vuln_by_plugin;compliance",
+    };
+
+    $json = rest_post("/scans/$sid/export?history_id=$hid", encode_json($exportdata), \$r);
+
+    if ( $r->code == 200 ) {
+        my $filehandle=$json->{file};
+        print "Initiated scan export to file $filehandle\n" if $verbose;
+
+        do {
+            sleep(5);
+            $json = rest_get("/scans/$sid/export/$filehandle/status", {}, \$r);
+
+            #$json will be undefined if trying to export a fileformat will fail
+            if (!defined $json) {
+                print "Exporting scan to $format failed, skipping\n";
+                last;
+            }
+
+            if ($r->code() eq 200) {
+                print "Scan export status: $json->{status}\n";
+            } else {
+                print "Scan export status request returned " . $r->code() if $verbose;
+            }
+        } until ($json->{status} eq 'ready');
+
+        rest_get("/scans/$sid/export/$filehandle/download", {}, \$r,1 ); # This call doesn't return json, but a file
+
+        die "Cannot download report" if ($r->code() != 200);
+        print "Report downloaded, saving $filehandle to $tempfile.$format\n" if $verbose;
+        open( my $FILE, ">", "$tempfile.$format") or die "Cannot save report";
+        print $FILE $r->decoded_content();
+        close $FILE;
+
+    } else {
+        print "Could not initiate export in $format format, skipping.\n" if ($r->code() != 200 && ! $quiet);
+    }
+}
+
+rest_delete("/scans/$sid/history/$hid",{},\$r);
+die "Cannot delete report" if ($r->code() != 200);
+print "Report deleted from server\n" if $verbose;
+
+rest_delete("/scans/$sid" , {}, \$r);
+die "Cannot delete scan" if ($r->code() != 200);
+print "Scan deleted from server\n" if $verbose;
+
+rest_delete("/session", {}, \$r);
+die "Cannot log out" if ($r->code() != 200);
+print "Logged off server\n" if $verbose;
+
+print "Converting $tempfile.nessus to $tempfile.ivil.xml\n" unless $quiet;
+$cmd = "$nessus2ivil --infile '$tempfile.nessus'";
+$cmd .= " -v" if $verbose > 1;
+print "Executing $cmd\n" if $verbose > 1;
+my $result = `$cmd 2>&1`;
+print "$result\n" if $verbose > 1;
+
+print "Importing ivil\n" unless $quiet;
+$cmd = "$load_ivil --workspace '$workspace' --scan '$scan' --scanner Nessus --timestamp $timestamp";
+$cmd .= " -v" if $verbose > 1;
+$cmd .= " '$tempfile.ivil.xml'";
+print "Executing $cmd\n" if $verbose > 1;
+$result = `$cmd 2>&1`;
+print "$result\n" if $verbose > 1;
+
+print "Scan imported, adding files to scan $scan in workspace $workspace\n" unless $quiet;
+foreach my $format ( @formats, "ivil.xml") {
+    if ( -e "$tempfile.$format" ) {
+        print "Attaching file $tempfile.$format to scan\n" if $verbose;
+        $cmd = "$attach_file --workspace '$workspace' --scan '$scan' --timestamp $timestamp --file '$tempfile.$format' --description '$format output'";
+        $cmd .= " -v" if $verbose > 1;
+        print "Executing $cmd\n" if $verbose > 1;
+        $result = `$cmd 2>&1`;
+        print "$result\n" if $verbose > 1;
+    }
+}
+
+# Cleanup
+unless ( $nodelete ) {
+    foreach my $format ( @formats, "ivil.xml") {
+        if ( -e "$tempfile.$format" ) {
+            print "Deleting $tempfile.$format\n" if $verbose >1;
+            unlink "$tempfile.$format";
+        }
+    }
+}
+
+print "Done\n" unless $quiet;
+
+exit(0);
+
+sub help {
+    print "
+Usage: scan       --user=<username> --password=<password> --server=<server> \\
+                  --port=<portnumber> --policy=<policy name> \\
+                  --hosts=<hosts file|hosts spec> \\
+                  --workspace=<seccubus workspace> --scan=<seccubus scan>\\
+                  [--export=(nessus|html|pdf|csv|db)] [--nodelete] \\
+                  [--verbose] [--quiet] [--help]
+--user (-u)       - Nessus username
+--password (-p)   - Nessus password
+--server (-s)     - Nessus server (ip or name)
+--port            - Nessus server portnumber (default=8834)
+--policy          - Name of Nessus policy
+--hosts           - Specification of hosts to scan. Follows the Nessus rules
+                    for specifying hosts, or path to a file containing such
+                    specification
+--workspace (-ws) - Seccubus workspace the scan in in
+--scan (-sc)      - Seccubus scan the data should be saved in
+--export          - Export the scan in these formats (specify more then once
+                    for more formats), currently supported formats are:
+                    nessus, html, pdf, csv, db. Your server may not support them
+                    all. NOTE: you need to export the nessus format for Seccubus
+                    to work properly.
+--nodelete        - Don't erase temporary files
+--nosslcheck      - Don't validate Nessus' TLS certificate Common Name
+                    (default: true when port is 8834 false when port is 443)
+--sslcheck        - Do validate Nessus' TLS certificate Common Name
+                    (default: false when port is 8834 true when port is 443)
+--retries         - How many times should rest calls be retried before aborting
+                    the scan (default=3)
+--sleep           - Seconds to sleep between polls of the Nessus engine
+                    (default=10)
+--verbose (-v)    - Be verbose during execution
+--quiet (-q)      - Don't print output
+--help (-h)       - Print this message
+";
+    exit(1);
+}
+
+sub make_timestamp {
+    my ($second, $minute, $hour, $day, $month, $year) = localtime();
+    $month++;
+    $second = "0" . $second if $second < 10;
+    $minute = "0" . $minute if $minute <10;
+    $hour = "0". $hour if $hour < 10;
+    $day = "0". $day if $day <10;
+    $month = "0" . $month if $month <10;
+    $year += 1900;
+
+    return "$year$month$day$hour$minute$second";
+}
+
+sub login {
+    my $cred = {
+        'username' => $user,
+        'password' => $password
+    };
+    $token = undef;
+    my $r;
+    my $json = rest_post("/session",$cred, \$r);
+
+    confess "Cannot authenticate to scanner.\nReturn code: " . $r->code() . "\nMessage: " . $r->decoded_content() . " " unless $r->is_success;
+
+    print "Authenticated\n" if $verbose;
+
+    $token = $json->{token};
+}
+
+sub rest_get {
+    my $uri = shift;
+    my $params = shift;
+    my $response = shift;
+    my $nojson = shift;
+
+    rest_call("get",$uri,$params,$response,$nojson,$retries);
+}
+
+sub rest_post {
+    my $uri = shift;
+    my $params = shift;
+    my $response = shift;
+    my $nojson = shift;
+
+    rest_call("post",$uri, $params,$response,$nojson,$retries);
+}
+
+sub rest_put {
+    my $uri = shift;
+    my $params = shift;
+    my $response = shift;
+    my $nojson = shift;
+
+    rest_call("put",$uri, $params,$response,$nojson,$retries);
+}
+
+sub rest_delete {
+    my $uri = shift;
+    my $params = shift;
+    my $response = shift;
+    my $nojson = shift;
+
+    rest_call("delete",$uri, $params,$response,$nojson,$retries);
+}
+
+sub rest_call {
+    my $method = shift;
+    my $uri = shift;
+    my $param = shift;
+    my $response = shift;
+    my $nojson = shift;
+    my $retries = shift;
+
+    $ENV{PERL_LWP_SSL_VERIFY_HOSTNAME} = 0 unless $checkssl;
+    my $ua = LWP::UserAgent->new();
+    $ua->ssl_opts( SSL_verify_mode => 0 ) unless $checkssl;
+    $ua->agent("Seccubus $SeccubusV2::VERSION ");
+
+    $ua->default_header('Content-Type' => 'application/json');
+    $ua->default_header('Accept' => 'application/json');
+    # Disable max return size
+    $ua->max_size(undef);
+
+    if ( $token ) {
+        $ua->default_header('X-Cookie' => "token=$token");
+    }
+
+    my $r;
+    if ( $method eq "post" ) {
+        if ( $verbose > 1 ) {
+            print "POST to https://$server:$port$uri\nParams:\n";
+            print Dumper $param;
+        }
+        if ( ref $param ) {
+            $r = $ua->post("https://$server:$port$uri", $param);
+        } else {
+            my $req = HTTP::Request->new(POST => "https://$server:$port$uri");
+            $req->content_type('application/json');
+            $req->content($param);
+
+            $r = $ua->request($req);
+        }
+    } elsif ( $method eq "put" ) {
+        if ( $verbose > 1 ) {
+            print "PUT to https://$server:$port$uri\nParams:\n";
+            print Dumper $param;
+        }
+        if ( ref $param ) {
+            $r = $ua->put("https://$server:$port$uri", $param);
+        } else {
+            my $req = HTTP::Request->new(PUT => "https://$server:$port$uri");
+            $req->content_type('application/json');
+            $req->content($param);
+
+            $r = $ua->request($req);
+        }
+    } elsif ( $method eq "get" ) {
+        my $geturi = "$uri?";
+        foreach my $key ( sort keys %$param ) {
+            $geturi .= $key . "=" . $param->{$key} . "&";
+        }
+        $geturi =~ s/\&$//;
+        print "GET to https://$server:$port$geturi\n" if $verbose > 1;
+        $r = $ua->get("https://$server:$port$geturi");
+    } elsif ( $method eq "delete" ) {
+        print "DELETE to https://$server:$port$uri\n" if $verbose > 1;
+        if ( defined $ua->{delete} ) {
+            $r = $ua->delete("https://$server:$port$uri", $param);
+        } else {
+            print "Delete not supported on this platform\n" unless $quiet;
+            return({});
+        }
+    }
+    print "Server response : " . $r->decoded_content() . "\n" if $verbose > 2;
+
+    if ( $token && ( $r->code() == 401 || $r->code() == 503 ) && $retries > 0) {
+        print "Authentication failed, attempting to re-login\n" if $verbose;
+        # Login and retry if failed
+        login();
+        return(rest_call($method,$uri,$param,$response,$nojson,$retries-1));
+    }
+    # Export cvalls can actually return a 404 if an export has failed for some internal Nessus reason, we should not
+    # retry in this case
+    unless ( $r->is_success || ( $uri =~ qr#/scans/\d+/export/\d+\/status# && $r->code() == 404 ) ) {
+        unless ( $quiet ) {
+            #Internal server errors (500) should be fail gracefully so it does not loop
+            if ($uri =~ qr#/scans/\d+/export/\d+\/status# && $r->code() == 500) {
+                return;
+            }
+            print "Nessus server returned error code: " . $r->code() . "\nMessage: " . $r->decoded_content();
+            print "\n$retries retries left\n";
+        }
+        if ( $retries > 0 ) {
+            print "Sleeping for 30 seconds before retring\n" unless $quiet;
+            sleep 30;
+            return(rest_call($method,$uri,$param,$response,$nojson,$retries-1))
+        } else {
+            die "No more retries!\nNessus server returned error code: " . $r->code() . "\nMessage: " . $r->decoded_content() . " ";
+        }
+    }
+
+    $$response = $r if $response; # Return response object
+
+    unless ( $nojson ) {
+        my $json;
+
+        eval {
+            if ( $r->decoded_content() ) {
+                $json = decode_json($r->decoded_content());
+            } else {
+                $json = {};
+            }
+        } or do {
+            $json = {
+                error => "Unable to decode JSON from: " . $r->decoded_content()
+            }
+        };
+        if ( $json->{error} ) {
+            print "Server returned error: $json->{error}\n";
+        }
+        return $json;
+    }
+
+}
